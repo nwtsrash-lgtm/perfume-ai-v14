@@ -285,38 +285,29 @@ export default function HomePage() {
 
     try {
 
-      // ── Step 1.5: Fetch product image via browser and convert to base64 ──
-      // The browser can access mahwous.com (Cloudflare allows browsers)
-      // but the server cannot (403). So we fetch here and send base64.
+      // ── Step 1.5: Fetch product image via proxy-image API (bypasses CORS & Cloudflare) ──
+      // proxy-image runs server-side with proper User-Agent, bypassing CDN restrictions
       let productImageBase64: string | undefined;
       if (pd.imageUrl) {
         try {
           setLoadingStatus('جاري تحميل صورة المنتج...'); setLoadingProgress(12);
-          console.log('[page] Fetching product image via browser:', pd.imageUrl);
-          // Try direct fetch from browser (works for most CDNs)
-          const imgRes = await fetch(pd.imageUrl, { mode: 'cors' }).catch(() => null);
-          if (imgRes && imgRes.ok) {
-            const blob = await imgRes.blob();
-            productImageBase64 = await new Promise<string>((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result as string);
-              reader.readAsDataURL(blob);
-            });
-            console.log('[page] Product image fetched via browser, base64 length:', productImageBase64?.length);
-          } else {
-            // Fallback: try via proxy-image API
-            console.log('[page] Direct fetch failed, trying proxy-image...');
-            const proxyRes = await fetch('/api/proxy-image', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ url: pd.imageUrl }),
-            });
-            if (proxyRes.ok) {
-              const proxyData = await proxyRes.json();
-              if (proxyData.base64) {
-                productImageBase64 = proxyData.base64;
-                console.log('[page] Product image fetched via proxy, base64 length:', productImageBase64?.length);
-              }
+          console.log('[page] Fetching product image via proxy-image:', pd.imageUrl);
+          // Use proxy-image directly — avoids CORS issues with Salla CDN
+          const proxyRes = await fetch('/api/proxy-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: pd.imageUrl }),
+          });
+          if (proxyRes.ok) {
+            const proxyData = await proxyRes.json();
+            if (proxyData.base64) {
+              productImageBase64 = proxyData.base64;
+              console.log('[page] ✅ Product image loaded via proxy, base64 length:', productImageBase64?.length);
+            } else {
+              console.warn('[page] proxy-image returned no base64:', proxyData);
             }
+          } else {
+            console.warn('[page] proxy-image failed:', proxyRes.status);
           }
         } catch (imgErr) {
           console.warn('[page] Failed to fetch product image:', imgErr);
