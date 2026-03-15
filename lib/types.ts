@@ -54,6 +54,7 @@ export interface GenerationRequest {
   bottleDescription?: string;
   bottleAnalysis?: BottleAnalysis;
   productImageUrl?: string;  // URL of the real product image scraped from the store
+  productImageBase64?: string; // Base64 data URI of the product image (fetched by browser)
 }
 
 export interface GeneratedImage {

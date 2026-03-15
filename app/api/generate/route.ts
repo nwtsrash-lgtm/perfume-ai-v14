@@ -219,23 +219,32 @@ async function generateStage1(params: {
 
 async function stitchAndTransferBottle(params: {
   characterImageUrl: string;
-  bottleImageUrl: string;
+  bottleImageUrl?: string;
+  bottleImageBase64?: string;
   bottleName: string;
   bottleDescription?: string;
   loraPath: string;
   format: 'story' | 'post' | 'landscape';
   imageSize: { width: number; height: number };
 }): Promise<string> {
-  const { characterImageUrl, bottleImageUrl, bottleName, bottleDescription, loraPath, format, imageSize } = params;
+  const { characterImageUrl, bottleImageUrl, bottleImageBase64, bottleName, bottleDescription, loraPath, format, imageSize } = params;
 
   // ── Step 1: Download both images ──
   console.log(`[stitch] Downloading character image...`);
   const charBuffer = await fetchImageBuffer(characterImageUrl);
   if (!charBuffer) throw new Error('Failed to download character image');
 
-  console.log(`[stitch] Downloading bottle image from: ${bottleImageUrl.substring(0, 80)}...`);
-  const bottleBuffer = await fetchImageBuffer(bottleImageUrl);
-  if (!bottleBuffer) throw new Error('Failed to download bottle image');
+  // Get bottle image: prefer base64 (from browser), fallback to URL fetch
+  let bottleBuffer: Buffer | null = null;
+  if (bottleImageBase64) {
+    console.log(`[stitch] Using bottle image from base64 (browser-fetched), length: ${bottleImageBase64.length}`);
+    const base64Data = bottleImageBase64.replace(/^data:image\/[^;]+;base64,/, '');
+    bottleBuffer = Buffer.from(base64Data, 'base64');
+  } else if (bottleImageUrl) {
+    console.log(`[stitch] Downloading bottle image from URL: ${bottleImageUrl.substring(0, 80)}...`);
+    bottleBuffer = await fetchImageBuffer(bottleImageUrl);
+  }
+  if (!bottleBuffer) throw new Error('Failed to get bottle image (both base64 and URL failed)');
 
   // ── Step 2: Stitch images side by side ──
   // Get character dimensions
@@ -380,6 +389,7 @@ async function generateFormat(
   pipeline: string;
 }> {
   const { perfumeData, vibe = '', attire = '', bottleDescription, productImageUrl } = request;
+  const productImageBase64 = (request as any).productImageBase64 as string | undefined;
   const loraPath = request.loraPath?.trim() || MAHWOUS_LORA_URL;
   const triggerWord = request.loraTriggerWord?.trim() || MAHWOUS_TRIGGER;
 
@@ -408,16 +418,18 @@ async function generateFormat(
     console.log(`[stage-1] ${ac.format}: SUCCESS — ${stage1Url.substring(0, 60)}...`);
 
     // ── Stage 2: Image Stitching + Kontext — Transfer real bottle ──
-    const hasProductImage = productImageUrl && productImageUrl.trim().length > 10;
+    const hasProductImage = (productImageBase64 && productImageBase64.length > 100) || (productImageUrl && productImageUrl.trim().length > 10);
 
     if (hasProductImage) {
       try {
         const bottleName = `${perfumeData.brand} ${perfumeData.name}`.trim();
         console.log(`[stage-2] ${ac.format}: Image Stitching + Kontext — transferring real bottle...`);
+        console.log(`[stage-2] ${ac.format}: Has base64: ${!!productImageBase64}, Has URL: ${!!productImageUrl}`);
 
         const finalUrl = await stitchAndTransferBottle({
           characterImageUrl: stage1Url,
-          bottleImageUrl: productImageUrl!.trim(),
+          bottleImageBase64: productImageBase64 || undefined,
+          bottleImageUrl: productImageUrl?.trim() || undefined,
           bottleName,
           bottleDescription,
           loraPath,
@@ -509,19 +521,25 @@ export async function POST(request: NextRequest) {
       body.perfumeData?.imageUrl ||
       undefined;
 
+    // Use base64 from browser (bypasses Cloudflare/CDN restrictions)
+    const effectiveProductImageBase64 = (body as any).productImageBase64 || undefined;
+
     const enrichedBody = {
       ...body,
       bottleDescription: effectiveBottleDescription,
       productImageUrl: effectiveProductImageUrl,
+      productImageBase64: effectiveProductImageBase64,
     };
 
+    const hasImage = effectiveProductImageBase64 || effectiveProductImageUrl;
     console.log(`[generate] Pipeline v15 (Image Stitching + Kontext) — "${body.perfumeData.name}" by ${body.perfumeData.brand}`);
-    console.log(`[generate] Product image URL: ${effectiveProductImageUrl ? effectiveProductImageUrl.substring(0, 80) : 'none — Stage 1 only'}`);
-    console.log(`[generate] Pipeline mode: ${effectiveProductImageUrl ? 'STITCH + KONTEXT (real bottle transfer)' : 'STAGE 1 ONLY (no product image)'}`);
+    console.log(`[generate] Product image base64: ${effectiveProductImageBase64 ? `YES (${effectiveProductImageBase64.length} chars)` : 'none'}`);
+    console.log(`[generate] Product image URL: ${effectiveProductImageUrl ? effectiveProductImageUrl.substring(0, 80) : 'none'}`);
+    console.log(`[generate] Pipeline mode: ${hasImage ? 'STITCH + KONTEXT (real bottle transfer)' : 'STAGE 1 ONLY (no product image)'}`);
 
     // Generate all 3 formats in parallel
     const results = await Promise.all(
-      ASPECT_CONFIGS.map((ac) => generateFormat(enrichedBody, ac))
+      ASPECT_CONFIGS.map((ac) => generateFormat(enrichedBody as any, ac))
     );
 
     const completedImages = results.filter((r) => r.status === 'COMPLETED' && r.url);
