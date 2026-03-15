@@ -1,32 +1,30 @@
 // ============================================================
 // app/api/generate/route.ts
-// Mahwous Perfume AI — Image Generation Pipeline v14
+// Mahwous Perfume AI — Image Generation Pipeline v15
 //
-// STRATEGY (v14): Three-Stage Pipeline — SMART COMPOSITING
+// STRATEGY (v15): Two-Stage Pipeline — IMAGE STITCHING + KONTEXT
 //
 //   Stage 1: FLUX LoRA (text-to-image)
 //     → Generates MAHWOUS_MAN character holding a generic perfume bottle
 //     → LoRA weights guarantee consistent face/body
 //     → Natural holding pose with full hand grip
 //
-//   Stage 2: Smart Compositing (Sharp library) — REAL BOTTLE OVERLAY
-//     → Downloads Stage 1 character image
-//     → Downloads REAL product photo from mahwous.com
-//     → Composites the real bottle EXACTLY onto the character's hand
-//     → 100% bottle accuracy — pixel-perfect real product image
-//     → No AI hallucination — the real bottle is placed directly
+//   Stage 2: Image Stitching + Kontext LoRA (image-to-image)
+//     → Stitches Stage 1 image (LEFT) + real bottle photo (RIGHT)
+//     → Sends stitched image to Kontext with prompt:
+//       "Replace the bottle in the left image with the EXACT bottle
+//        from the right image"
+//     → Kontext transfers the real bottle design onto the character's hands
+//     → Crops output to left half (character only)
+//     → Result: character holding the REAL bottle naturally
 //
-//   Stage 3: FLUX Kontext (single image) — LIGHTING REFINEMENT
-//     → Refines lighting and shadows around the composited bottle
-//     → strength=0.25 — very light touch, preserves compositing
-//     → Only used when productImageUrl is available
+// WHY THIS WORKS:
+//   - Kontext can "see" the real bottle in the stitched image
+//   - No text description needed — visual reference is pixel-perfect
+//   - The character's hands naturally adapt to hold the real bottle
+//   - Same technique used in professional product placement
 //
-// WHY THREE STAGES:
-//   - Stage 1 gives natural pose + consistent character
-//   - Stage 2 places the EXACT real bottle (pixel-perfect, no AI guessing)
-//   - Stage 3 blends lighting so the bottle looks natural in the scene
-//
-// FALLBACK: If Stage 2/3 fails, Stage 1 image is returned as-is
+// FALLBACK: If Stage 2 fails, Stage 1 image is returned as-is
 // ============================================================
 
 import { NextRequest, NextResponse } from 'next/server';
@@ -76,26 +74,6 @@ const ASPECT_CONFIGS = [
   },
 ];
 
-// ─── Bottle overlay configuration per format ─────────────────────────────────
-// These ratios place the bottle in the character's hand area
-const BOTTLE_OVERLAY_CONFIG = {
-  story: {
-    widthRatio: 0.28,   // bottle width = 28% of image width
-    leftRatio: 0.36,    // left position = 36% from left
-    topRatio: 0.42,     // top position = 42% from top
-  },
-  post: {
-    widthRatio: 0.30,
-    leftRatio: 0.35,
-    topRatio: 0.38,
-  },
-  landscape: {
-    widthRatio: 0.22,
-    leftRatio: 0.38,
-    topRatio: 0.30,
-  },
-};
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Image Proxy Helper — fetches image as buffer (handles Salla CDN 403)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -135,13 +113,6 @@ async function fetchImageBuffer(imageUrl: string): Promise<Buffer | null> {
     console.warn(`[proxy] fetchImageBuffer error:`, err);
     return null;
   }
-}
-
-async function fetchImageAsBase64(imageUrl: string): Promise<string | null> {
-  const buffer = await fetchImageBuffer(imageUrl);
-  if (!buffer) return null;
-  const base64 = buffer.toString('base64');
-  return `data:image/jpeg;base64,${base64}`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -239,235 +210,129 @@ async function generateStage1(params: {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 2: Smart Compositing — Place REAL bottle onto character's hand
-// Uses Sharp to pixel-perfectly overlay the real product image
+// Stage 2: Image Stitching + Kontext LoRA
+// 1. Download Stage 1 character image + real bottle image
+// 2. Stitch them side by side (character LEFT, bottle RIGHT)
+// 3. Send to Kontext with prompt to transfer the bottle
+// 4. Crop output to left half (character with real bottle)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function compositeRealBottle(params: {
+async function stitchAndTransferBottle(params: {
   characterImageUrl: string;
   bottleImageUrl: string;
+  bottleName: string;
+  bottleDescription?: string;
+  loraPath: string;
   format: 'story' | 'post' | 'landscape';
-}): Promise<Buffer> {
-  const { characterImageUrl, bottleImageUrl, format } = params;
+  imageSize: { width: number; height: number };
+}): Promise<string> {
+  const { characterImageUrl, bottleImageUrl, bottleName, bottleDescription, loraPath, format, imageSize } = params;
 
-  // Download both images
-  const [charBuffer, bottleBuffer] = await Promise.all([
-    fetchImageBuffer(characterImageUrl),
-    fetchImageBuffer(bottleImageUrl),
-  ]);
-
+  // ── Step 1: Download both images ──
+  console.log(`[stitch] Downloading character image...`);
+  const charBuffer = await fetchImageBuffer(characterImageUrl);
   if (!charBuffer) throw new Error('Failed to download character image');
+
+  console.log(`[stitch] Downloading bottle image from: ${bottleImageUrl.substring(0, 80)}...`);
+  const bottleBuffer = await fetchImageBuffer(bottleImageUrl);
   if (!bottleBuffer) throw new Error('Failed to download bottle image');
 
-  // Get character image dimensions
+  // ── Step 2: Stitch images side by side ──
+  // Get character dimensions
   const charMeta = await sharp(charBuffer).metadata();
-  const charWidth = charMeta.width || 1080;
-  const charHeight = charMeta.height || 1920;
+  const charW = charMeta.width || imageSize.width;
+  const charH = charMeta.height || imageSize.height;
 
-  // Calculate bottle overlay dimensions based on format
-  const config = BOTTLE_OVERLAY_CONFIG[format] || BOTTLE_OVERLAY_CONFIG.post;
-  const bottleWidth = Math.round(charWidth * config.widthRatio);
-  const bottleLeft = Math.round(charWidth * config.leftRatio);
-  const bottleTop = Math.round(charHeight * config.topRatio);
-
-  // Get bottle aspect ratio to maintain proportions
+  // Resize bottle to match character height (maintain aspect ratio)
   const bottleMeta = await sharp(bottleBuffer).metadata();
-  const bottleAspect = (bottleMeta.height || 1) / (bottleMeta.width || 1);
-  const bottleHeight = Math.round(bottleWidth * bottleAspect);
+  const bottleOrigW = bottleMeta.width || 800;
+  const bottleOrigH = bottleMeta.height || 800;
+  const bottleNewH = charH;
+  const bottleNewW = Math.round(bottleOrigW * (charH / bottleOrigH));
 
-  console.log(`[composite] Format: ${format}, charSize: ${charWidth}x${charHeight}`);
-  console.log(`[composite] Bottle overlay: ${bottleWidth}x${bottleHeight} at (${bottleLeft}, ${bottleTop})`);
-
-  // Process bottle: resize and convert to PNG (supports transparency)
-  const processedBottle = await sharp(bottleBuffer)
-    .resize(bottleWidth, bottleHeight, {
-      fit: 'contain',
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-    })
-    .png()
+  const bottleResized = await sharp(bottleBuffer)
+    .resize(bottleNewW, bottleNewH, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 1 } })
+    .jpeg({ quality: 90 })
     .toBuffer();
 
-  // Composite the real bottle onto the character image
-  const composited = await sharp(charBuffer)
-    .composite([
-      {
-        input: processedBottle,
-        left: bottleLeft,
-        top: bottleTop,
-        blend: 'over',
-      },
-    ])
+  // Ensure character is JPEG
+  const charJpeg = await sharp(charBuffer)
     .jpeg({ quality: 95 })
     .toBuffer();
 
-  console.log(`[composite] SUCCESS — composited image: ${composited.length} bytes`);
-  return composited;
-}
+  // Create stitched canvas: character LEFT + bottle RIGHT
+  const stitchW = charW + bottleNewW;
+  const stitchH = charH;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Stage 3: FLUX Kontext — Light refinement for natural lighting (optional)
-// strength=0.25 — very light touch, preserves the composited bottle
-// ═══════════════════════════════════════════════════════════════════════════════
+  const stitchedBuffer = await sharp({
+    create: {
+      width: stitchW,
+      height: stitchH,
+      channels: 3,
+      background: { r: 255, g: 255, b: 255 },
+    },
+  })
+    .composite([
+      { input: charJpeg, left: 0, top: 0 },
+      { input: bottleResized, left: charW, top: 0 },
+    ])
+    .jpeg({ quality: 90 })
+    .toBuffer();
 
-async function refineWithKontext(params: {
-  imageBase64: string;  // base64 data URI of composited image
-  bottleName: string;
-  loraPath: string;
-}): Promise<string> {
-  const { imageBase64, bottleName, loraPath } = params;
+  console.log(`[stitch] Stitched image: ${stitchW}x${stitchH} (${Math.round(stitchedBuffer.length / 1024)}KB)`);
 
-  const prompt = `The ${bottleName} perfume bottle in the character's hand — refine the lighting and shadows around the bottle so it blends naturally with the scene. Keep the bottle appearance EXACTLY the same. Keep the character, pose, background, and 3D animation style EXACTLY the same. Only improve the lighting integration.`;
+  // Convert to base64 data URI
+  const stitchedBase64 = `data:image/jpeg;base64,${stitchedBuffer.toString('base64')}`;
 
-  const input: Record<string, unknown> = {
-    image_url: imageBase64,
-    prompt,
-    num_inference_steps: 30,
-    guidance_scale: 20,
-    strength: 0.25,  // Very light — just lighting refinement
+  // ── Step 3: Send to Kontext LoRA ──
+  // Build a detailed prompt for bottle transfer
+  const bottleDesc = bottleDescription
+    ? `The bottle on the right is: ${bottleDescription}.`
+    : `The bottle on the right is the ${bottleName} perfume bottle.`;
+
+  const kontextPrompt = `The person on the left is holding a perfume bottle. Replace that bottle with the EXACT perfume bottle shown on the right side of the image. ${bottleDesc} The replacement must be pixel-perfect — same shape, same colors, same labels, same cap, same design details. Keep everything else unchanged — same person, same pose, same hands, same face, same background, same 3D Pixar animation style. Only change the bottle to match the reference on the right exactly. The character should naturally hold this exact bottle with both hands.`;
+
+  console.log(`[stitch] Sending to Kontext LoRA for bottle transfer...`);
+
+  const kontextInput: Record<string, unknown> = {
+    image_url: stitchedBase64,
+    prompt: kontextPrompt,
+    num_inference_steps: 28,
+    guidance_scale: 4.5,
     num_images: 1,
     enable_safety_checker: false,
     output_format: 'jpeg',
-    loras: [{ path: loraPath.trim(), scale: 0.6 }],
+    loras: [{ path: loraPath.trim(), scale: 0.4 }],
   };
 
-  const requestId = await submitToFal(FAL_MODEL_KONTEXT, input);
-  return await pollFalUntilDone(FAL_MODEL_KONTEXT, requestId, 90_000);
-}
+  const requestId = await submitToFal(FAL_MODEL_KONTEXT, kontextInput);
+  const kontextResultUrl = await pollFalUntilDone(FAL_MODEL_KONTEXT, requestId, 120_000);
 
-// ─── Generate a single format (Three-Stage Pipeline v14) ─────────────────────
-async function generateFormat(
-  request: GenerationRequest,
-  ac: typeof ASPECT_CONFIGS[0],
-): Promise<{
-  format: string;
-  label: string;
-  dimensions: { width: number; height: number };
-  aspectRatio: string;
-  url: string | null;
-  status: 'COMPLETED' | 'FAILED';
-  pipeline: string;
-}> {
-  const { perfumeData, vibe = '', attire = '', bottleDescription, productImageUrl } = request;
-  const loraPath = request.loraPath?.trim() || MAHWOUS_LORA_URL;
-  const triggerWord = request.loraTriggerWord?.trim() || MAHWOUS_TRIGGER;
+  console.log(`[stitch] Kontext result: ${kontextResultUrl.substring(0, 60)}...`);
 
-  try {
-    console.log(`[pipeline-v14] Generating ${ac.format} — "${perfumeData.name}" by ${perfumeData.brand}`);
+  // ── Step 4: Download result and crop to left half (character only) ──
+  const resultBuffer = await fetchImageBuffer(kontextResultUrl);
+  if (!resultBuffer) throw new Error('Failed to download Kontext result');
 
-    // ── Stage 1: FLUX LoRA — Character with generic bottle ──
-    const fluxPrompt = buildFluxPrompt({
-      perfumeData,
-      vibe,
-      attire,
-      aspectHint: ac.aspectHint,
-      bottleDescription: undefined, // Generic bottle for natural pose
-      loraTriggerWord: triggerWord,
-      hasBottleReference: false,
-    });
-    const negativePrompt = buildNegativePrompt();
+  const resultMeta = await sharp(resultBuffer).metadata();
+  const resultW = resultMeta.width || stitchW;
+  const resultH = resultMeta.height || stitchH;
 
-    console.log(`[stage-1] ${ac.format}: Generating character with generic bottle...`);
-    const stage1Url = await generateStage1({
-      prompt: fluxPrompt,
-      negativePrompt,
-      loraPath,
-      imageSize: ac.imageSize,
-    });
-    console.log(`[stage-1] ${ac.format}: SUCCESS — ${stage1Url.substring(0, 60)}...`);
+  // Calculate crop width proportional to original character width
+  const cropW = Math.round(resultW * (charW / stitchW));
 
-    // ── Stage 2: Smart Compositing — Place REAL bottle onto hand ──
-    const hasProductImage = productImageUrl && productImageUrl.trim().length > 10;
+  const croppedBuffer = await sharp(resultBuffer)
+    .extract({ left: 0, top: 0, width: cropW, height: resultH })
+    .jpeg({ quality: 95 })
+    .toBuffer();
 
-    if (hasProductImage) {
-      try {
-        console.log(`[stage-2] ${ac.format}: Smart Compositing — placing real bottle from ${productImageUrl!.substring(0, 60)}...`);
+  console.log(`[stitch] Cropped to character: ${cropW}x${resultH} (${Math.round(croppedBuffer.length / 1024)}KB)`);
 
-        const compositedBuffer = await compositeRealBottle({
-          characterImageUrl: stage1Url,
-          bottleImageUrl: productImageUrl!.trim(),
-          format: ac.format,
-        });
+  // ── Step 5: Upload cropped result to fal.ai storage ──
+  const publicUrl = await uploadBufferToFal(croppedBuffer, `v15_${format}_${Date.now()}.jpg`);
+  console.log(`[stitch] Final uploaded: ${publicUrl.substring(0, 80)}`);
 
-        // Convert composited image to base64 data URI for Stage 3
-        const compositedBase64 = `data:image/jpeg;base64,${compositedBuffer.toString('base64')}`;
-        console.log(`[stage-2] ${ac.format}: Compositing SUCCESS (${Math.round(compositedBuffer.length / 1024)}KB)`);
-
-        // ── Stage 3: Kontext Lighting Refinement (light touch) ──
-        try {
-          console.log(`[stage-3] ${ac.format}: Refining lighting with Kontext (strength=0.25)...`);
-          const bottleName = `${perfumeData.brand} ${perfumeData.name}`.trim();
-          const refinedUrl = await refineWithKontext({
-            imageBase64: compositedBase64,
-            bottleName,
-            loraPath,
-          });
-          console.log(`[stage-3] ${ac.format}: Refinement SUCCESS — ${refinedUrl.substring(0, 60)}...`);
-
-          return {
-            format: ac.format,
-            label: ac.label,
-            dimensions: ac.dimensions,
-            aspectRatio: ac.aspectRatio,
-            url: refinedUrl,
-            status: 'COMPLETED',
-            pipeline: 'smart_composite_kontext_v14',
-          };
-        } catch (stage3Err) {
-          // Stage 3 failed — use composited image directly (still has real bottle!)
-          console.warn(`[stage-3] ${ac.format}: Refinement failed, using composited image:`, stage3Err);
-
-          // Upload composited buffer to fal.ai storage for a public URL
-          const uploadedUrl = await uploadBufferToFal(compositedBuffer, `composite_${ac.format}.jpg`);
-
-          return {
-            format: ac.format,
-            label: ac.label,
-            dimensions: ac.dimensions,
-            aspectRatio: ac.aspectRatio,
-            url: uploadedUrl,
-            status: 'COMPLETED',
-            pipeline: 'smart_composite_only_v14',
-          };
-        }
-      } catch (stage2Err) {
-        // Stage 2 failed — fall back to Stage 1 image
-        console.warn(`[stage-2] ${ac.format}: Compositing FAILED, using Stage 1 image:`, stage2Err);
-        return {
-          format: ac.format,
-          label: ac.label,
-          dimensions: ac.dimensions,
-          aspectRatio: ac.aspectRatio,
-          url: stage1Url,
-          status: 'COMPLETED',
-          pipeline: 'flux_lora_only_v14_fallback',
-        };
-      }
-    }
-
-    // No product image — return Stage 1 directly
-    console.log(`[stage-2] ${ac.format}: No product image — returning Stage 1 result`);
-    return {
-      format: ac.format,
-      label: ac.label,
-      dimensions: ac.dimensions,
-      aspectRatio: ac.aspectRatio,
-      url: stage1Url,
-      status: 'COMPLETED',
-      pipeline: 'flux_lora_only_v14',
-    };
-
-  } catch (err) {
-    console.error(`[pipeline-v14] FAILED (${ac.format}):`, err);
-    return {
-      format: ac.format,
-      label: ac.label,
-      dimensions: ac.dimensions,
-      aspectRatio: ac.aspectRatio,
-      url: null,
-      status: 'FAILED',
-      pipeline: 'failed',
-    };
-  }
+  return publicUrl;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -501,6 +366,117 @@ async function uploadBufferToFal(buffer: Buffer, filename: string): Promise<stri
   return url;
 }
 
+// ─── Generate a single format (Two-Stage Pipeline v15) ──────────────────────
+async function generateFormat(
+  request: GenerationRequest,
+  ac: typeof ASPECT_CONFIGS[0],
+): Promise<{
+  format: string;
+  label: string;
+  dimensions: { width: number; height: number };
+  aspectRatio: string;
+  url: string | null;
+  status: 'COMPLETED' | 'FAILED';
+  pipeline: string;
+}> {
+  const { perfumeData, vibe = '', attire = '', bottleDescription, productImageUrl } = request;
+  const loraPath = request.loraPath?.trim() || MAHWOUS_LORA_URL;
+  const triggerWord = request.loraTriggerWord?.trim() || MAHWOUS_TRIGGER;
+
+  try {
+    console.log(`[pipeline-v15] Generating ${ac.format} — "${perfumeData.name}" by ${perfumeData.brand}`);
+
+    // ── Stage 1: FLUX LoRA — Character with generic bottle ──
+    const fluxPrompt = buildFluxPrompt({
+      perfumeData,
+      vibe,
+      attire,
+      aspectHint: ac.aspectHint,
+      bottleDescription: undefined, // Generic bottle for natural pose
+      loraTriggerWord: triggerWord,
+      hasBottleReference: false,
+    });
+    const negativePrompt = buildNegativePrompt();
+
+    console.log(`[stage-1] ${ac.format}: Generating character with generic bottle...`);
+    const stage1Url = await generateStage1({
+      prompt: fluxPrompt,
+      negativePrompt,
+      loraPath,
+      imageSize: ac.imageSize,
+    });
+    console.log(`[stage-1] ${ac.format}: SUCCESS — ${stage1Url.substring(0, 60)}...`);
+
+    // ── Stage 2: Image Stitching + Kontext — Transfer real bottle ──
+    const hasProductImage = productImageUrl && productImageUrl.trim().length > 10;
+
+    if (hasProductImage) {
+      try {
+        const bottleName = `${perfumeData.brand} ${perfumeData.name}`.trim();
+        console.log(`[stage-2] ${ac.format}: Image Stitching + Kontext — transferring real bottle...`);
+
+        const finalUrl = await stitchAndTransferBottle({
+          characterImageUrl: stage1Url,
+          bottleImageUrl: productImageUrl!.trim(),
+          bottleName,
+          bottleDescription,
+          loraPath,
+          format: ac.format,
+          imageSize: ac.imageSize,
+        });
+
+        console.log(`[stage-2] ${ac.format}: SUCCESS — ${finalUrl.substring(0, 60)}...`);
+
+        return {
+          format: ac.format,
+          label: ac.label,
+          dimensions: ac.dimensions,
+          aspectRatio: ac.aspectRatio,
+          url: finalUrl,
+          status: 'COMPLETED',
+          pipeline: 'stitch_kontext_v15',
+        };
+      } catch (stage2Err) {
+        // Stage 2 failed — fall back to Stage 1 image
+        console.warn(`[stage-2] ${ac.format}: Stitching+Kontext FAILED, using Stage 1 image:`, stage2Err);
+        return {
+          format: ac.format,
+          label: ac.label,
+          dimensions: ac.dimensions,
+          aspectRatio: ac.aspectRatio,
+          url: stage1Url,
+          status: 'COMPLETED',
+          pipeline: 'flux_lora_only_v15_fallback',
+        };
+      }
+    }
+
+    // No product image — return Stage 1 directly
+    console.log(`[stage-2] ${ac.format}: No product image — returning Stage 1 result`);
+    return {
+      format: ac.format,
+      label: ac.label,
+      dimensions: ac.dimensions,
+      aspectRatio: ac.aspectRatio,
+      url: stage1Url,
+      status: 'COMPLETED',
+      pipeline: 'flux_lora_only_v15',
+    };
+
+  } catch (err) {
+    console.error(`[pipeline-v15] FAILED (${ac.format}):`, err);
+    return {
+      format: ac.format,
+      label: ac.label,
+      dimensions: ac.dimensions,
+      aspectRatio: ac.aspectRatio,
+      url: null,
+      status: 'FAILED',
+      pipeline: 'failed',
+    };
+  }
+}
+
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
   try {
@@ -527,7 +503,7 @@ export async function POST(request: NextRequest) {
       body.bottleAnalysis?.loraPromptAddition ||
       undefined;
 
-    // Use the real product image URL from scraper (perfumeData.imageUrl) for Stage 2 compositing
+    // Use the real product image URL from scraper (perfumeData.imageUrl) for Stage 2
     const effectiveProductImageUrl =
       body.productImageUrl ||
       body.perfumeData?.imageUrl ||
@@ -539,9 +515,9 @@ export async function POST(request: NextRequest) {
       productImageUrl: effectiveProductImageUrl,
     };
 
-    console.log(`[generate] Pipeline v14 (Smart Compositing + Kontext Lighting) — "${body.perfumeData.name}" by ${body.perfumeData.brand}`);
+    console.log(`[generate] Pipeline v15 (Image Stitching + Kontext) — "${body.perfumeData.name}" by ${body.perfumeData.brand}`);
     console.log(`[generate] Product image URL: ${effectiveProductImageUrl ? effectiveProductImageUrl.substring(0, 80) : 'none — Stage 1 only'}`);
-    console.log(`[generate] Pipeline mode: ${effectiveProductImageUrl ? 'SMART COMPOSITING (real bottle pixel-perfect)' : 'STAGE 1 ONLY (no product image)'}`);
+    console.log(`[generate] Pipeline mode: ${effectiveProductImageUrl ? 'STITCH + KONTEXT (real bottle transfer)' : 'STAGE 1 ONLY (no product image)'}`);
 
     // Generate all 3 formats in parallel
     const results = await Promise.all(
@@ -571,7 +547,7 @@ export async function POST(request: NextRequest) {
         url: img.url,
         aspectRatio: img.aspectRatio,
       })),
-      pipeline: 'smart_composite_v14',
+      pipeline: 'stitch_kontext_v15',
     }, { status: 200 });
 
   } catch (error: unknown) {
