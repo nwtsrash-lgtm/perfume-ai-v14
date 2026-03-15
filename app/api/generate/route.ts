@@ -44,7 +44,7 @@ const MAHWOUS_TRIGGER = 'MAHWOUS_MAN';
 const FAL_KEY_ENV = () => process.env.FAL_KEY ?? '';
 const FAL_QUEUE_BASE = 'https://queue.fal.run';
 const FAL_MODEL_T2I = 'fal-ai/flux-lora';
-const FAL_MODEL_KONTEXT = 'fal-ai/flux-kontext-lora';
+const FAL_MODEL_KONTEXT = 'fal-ai/flux-kontext-pro';
 
 // ─── Aspect ratio configurations ─────────────────────────────────────────────
 const ASPECT_CONFIGS = [
@@ -134,12 +134,17 @@ async function submitToFal(model: string, input: Record<string, unknown>): Promi
 
   if (!res.ok) {
     const errText = await res.text();
+    console.error(`[fal] Submit failed for ${model}: ${res.status} — ${errText.substring(0, 200)}`);
     throw new Error(`fal.ai submit error ${res.status}: ${errText}`);
   }
 
   const data = await res.json();
   const requestId = data?.request_id as string | undefined;
-  if (!requestId) throw new Error('fal.ai did not return a request_id');
+  if (!requestId) {
+    console.error(`[fal] No request_id in response:`, JSON.stringify(data).substring(0, 200));
+    throw new Error('fal.ai did not return a request_id');
+  }
+  console.log(`[fal] Submitted to ${model}, request_id: ${requestId}`);
   return requestId;
 }
 
@@ -168,8 +173,15 @@ async function pollFalUntilDone(model: string, requestId: string, timeoutMs = 12
       });
       if (!resultRes.ok) throw new Error(`fal.ai result fetch error ${resultRes.status}`);
       const result = await resultRes.json();
-      const imageUrl: string | undefined = result?.images?.[0]?.url ?? result?.image?.url;
-      if (!imageUrl) throw new Error('fal.ai returned no image URL');
+      // Support both flux-lora (images[]) and flux-kontext-pro (images[] or image.url)
+      const imageUrl: string | undefined =
+        result?.images?.[0]?.url ??
+        result?.image?.url ??
+        result?.output?.images?.[0]?.url;
+      if (!imageUrl) {
+        console.error('[fal] Unexpected result structure:', JSON.stringify(result).substring(0, 300));
+        throw new Error('fal.ai returned no image URL');
+      }
       return imageUrl;
     }
 
@@ -230,19 +242,28 @@ async function stitchAndTransferBottle(params: {
   const { characterImageUrl, bottleImageUrl, bottleImageBase64, bottleName, bottleDescription, loraPath, format, imageSize } = params;
 
   // ── Step 1: Download both images ──
-  console.log(`[stitch] Downloading character image...`);
+  console.log(`[stitch-v16] === STAGE 2 START: ${format} ===`);
+  console.log(`[stitch-v16] Character URL: ${characterImageUrl.substring(0, 80)}`);
+  console.log(`[stitch-v16] Bottle base64: ${bottleImageBase64 ? `YES (${bottleImageBase64.length} chars)` : 'NO'}`);
+  console.log(`[stitch-v16] Bottle URL: ${bottleImageUrl ? bottleImageUrl.substring(0, 80) : 'NO'}`);
+  console.log(`[stitch-v16] Model: ${FAL_MODEL_KONTEXT}`);
+
+  console.log(`[stitch-v16] Downloading character image...`);
   const charBuffer = await fetchImageBuffer(characterImageUrl);
   if (!charBuffer) throw new Error('Failed to download character image');
+  console.log(`[stitch-v16] Character image: ${charBuffer.length} bytes`);
 
   // Get bottle image: prefer base64 (from browser), fallback to URL fetch
   let bottleBuffer: Buffer | null = null;
   if (bottleImageBase64) {
-    console.log(`[stitch] Using bottle image from base64 (browser-fetched), length: ${bottleImageBase64.length}`);
+    console.log(`[stitch-v16] Using bottle image from base64 (browser-fetched), length: ${bottleImageBase64.length}`);
     const base64Data = bottleImageBase64.replace(/^data:image\/[^;]+;base64,/, '');
     bottleBuffer = Buffer.from(base64Data, 'base64');
+    console.log(`[stitch-v16] Bottle buffer from base64: ${bottleBuffer.length} bytes`);
   } else if (bottleImageUrl) {
-    console.log(`[stitch] Downloading bottle image from URL: ${bottleImageUrl.substring(0, 80)}...`);
+    console.log(`[stitch-v16] Downloading bottle image from URL: ${bottleImageUrl.substring(0, 80)}...`);
     bottleBuffer = await fetchImageBuffer(bottleImageUrl);
+    console.log(`[stitch-v16] Bottle buffer from URL: ${bottleBuffer ? bottleBuffer.length + ' bytes' : 'FAILED'}`);
   }
   if (!bottleBuffer) throw new Error('Failed to get bottle image (both base64 and URL failed)');
 
@@ -322,12 +343,12 @@ RULES:
   const kontextInput: Record<string, unknown> = {
     image_url: stitchedBase64,
     prompt: kontextPrompt,
-    num_inference_steps: 35,
-    guidance_scale: 7.5,
+    num_inference_steps: 28,
+    guidance_scale: 3.5,
     num_images: 1,
     enable_safety_checker: false,
     output_format: 'jpeg',
-    loras: [{ path: loraPath.trim(), scale: 0.1 }],
+    // NO LoRA in Stage 2 — flux-kontext-pro handles bottle replacement natively
   };
 
   const requestId = await submitToFal(FAL_MODEL_KONTEXT, kontextInput);
