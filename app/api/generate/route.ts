@@ -479,7 +479,7 @@ async function uploadBufferToFal(buffer: Buffer, filename: string): Promise<stri
   if (!falKey) throw new Error('FAL_KEY is not set.');
 
   const formData = new FormData();
-  const blob = new Blob([buffer], { type: 'image/jpeg' });
+  const blob = new Blob([new Uint8Array(buffer)], { type: 'image/jpeg' });
   formData.append('file', blob, filename);
 
   const res = await fetch('https://rest.fal.run/storage/upload', {
