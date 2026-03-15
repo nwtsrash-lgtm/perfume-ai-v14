@@ -299,19 +299,35 @@ async function stitchAndTransferBottle(params: {
     ? `The bottle on the right is: ${bottleDescription}.`
     : `The bottle on the right is the ${bottleName} perfume bottle.`;
 
-  const kontextPrompt = `The person on the left is holding a perfume bottle. Replace that bottle with the EXACT perfume bottle shown on the right side of the image. ${bottleDesc} The replacement must be pixel-perfect — same shape, same colors, same labels, same cap, same design details. Keep everything else unchanged — same person, same pose, same hands, same face, same background, same 3D Pixar animation style. Only change the bottle to match the reference on the right exactly. The character should naturally hold this exact bottle with both hands.`;
+  const kontextPrompt = `TASK: Replace the perfume bottle held by the person on the LEFT with the exact bottle shown on the RIGHT.
+
+The bottle on the RIGHT is the reference. Copy it EXACTLY:
+- Same bottle shape and silhouette
+- Same colors (do NOT change colors)
+- Same label text and design
+- Same cap shape and color
+- Same glass transparency and reflections
+- Same size proportions
+
+${bottleDesc}
+
+RULES:
+1. The person, face, hands, pose, background, and 3D Pixar style must remain IDENTICAL
+2. ONLY the bottle changes — replace it with the exact reference bottle from the right
+3. The character holds the new bottle naturally with both hands
+4. Do NOT invent or modify the bottle design — copy it pixel-perfectly from the right side`;
 
   console.log(`[stitch] Sending to Kontext LoRA for bottle transfer...`);
 
   const kontextInput: Record<string, unknown> = {
     image_url: stitchedBase64,
     prompt: kontextPrompt,
-    num_inference_steps: 28,
-    guidance_scale: 4.5,
+    num_inference_steps: 35,
+    guidance_scale: 7.5,
     num_images: 1,
     enable_safety_checker: false,
     output_format: 'jpeg',
-    loras: [{ path: loraPath.trim(), scale: 0.4 }],
+    loras: [{ path: loraPath.trim(), scale: 0.1 }],
   };
 
   const requestId = await submitToFal(FAL_MODEL_KONTEXT, kontextInput);
